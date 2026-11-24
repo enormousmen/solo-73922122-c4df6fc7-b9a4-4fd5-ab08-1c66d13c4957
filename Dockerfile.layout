@@ -1,0 +1,16 @@
+# Builds the demo OCI layout into the named volume `oci-layout`, then exits.
+# Everything else in the stack only reads from that volume, except the API's
+# own state volume.
+FROM python:3.11-slim
+
+WORKDIR /srv
+COPY scripts ./scripts
+
+# amd64 candidate layers are deliberately larger than arm64 so that the amd64
+# scan is visibly slower in the concurrency demo.  The preloaded v1 images are
+# the same size on both architectures apart from this payload knob.
+CMD ["python", "scripts/build_layout.py", \
+     "--out", "/oci-layout", \
+     "--meta", "/oci-layout/demo-digests.json", \
+     "--amd64-payload-bytes", "2097152", \
+     "--arm64-payload-bytes", "8192"]

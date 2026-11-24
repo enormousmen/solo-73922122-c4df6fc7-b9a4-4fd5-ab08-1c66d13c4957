@@ -1,0 +1,44 @@
+name: edge-stable-release
+
+# One-shot job that writes a preloaded dual-architecture (amd64 + arm64) stable
+# index into the shared `oci-layout` volume.
+services:
+  layout-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.layout
+    volumes:
+      - oci-layout:/oci-layout
+    restart: "no"
+
+  release-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      layout-init:
+        condition: service_completed_successfully
+    environment:
+      PYTHONPATH: /srv
+      OCI_LAYOUT_DIR: /oci-layout
+      STATE_DIR: /state
+      OCI_INDEX_REF: registry.example.com/edge/stable:latest
+      OCI_ARCHITECTURES: amd64,arm64
+      LAYER_CHUNK_BYTES: "65536"
+      # Demo-only: stretch the layer scan so the concurrency demo is visible on
+      # small demo layers. Set to 0 for real deployments.
+      LAYER_CHUNK_DELAY_MS: "1"
+    volumes:
+      # Read-only: the service can never mutate the image layout.
+      - oci-layout:/oci-layout:ro
+      # Durable last-success state, survives restarts and recreations.
+      - release-state:/state
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Default CMD runs two uvicorn workers; they share /state through an flock +
+    # atomic rename, and reads never take the lock.
+
+volumes:
+  oci-layout:
+  release-state:
