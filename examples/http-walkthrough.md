@@ -116,14 +116,15 @@ The index is untouched. Retry with the current digest to succeed.
 
 | Status | `error.code` | Meaning |
 | --- | --- | --- |
-| 422 | `invalid_platform` | not `linux/amd64` or `linux/arm64` |
+| 422 | `invalid_platform` | not `linux/amd64` or `linux/arm64`, a configured architecture is missing from the coexistence request, or a platform is listed twice |
+| 422 | `invalid_digest` | malformed `sha256:…` digest, including in a coexistence request |
 | 422 | `platform_mismatch` | manifest config says a different architecture |
 | 422 | `blob_not_found` | manifest/config/layer absent from the read-only layout |
 | 422 | `digest_mismatch` | manifest or layer content does not hash to the descriptor |
 | 422 | `size_mismatch` | descriptor `size` differs from the actual blob length |
 | 422 | `unsupported_media_type` | manifest/config/layer media type not allowed |
 | 409 | `conflict` | `expectedPreviousDigest` no longer matches the stable index |
-| 503 | `state_unavailable` | durable state is unreadable/unwritable |
+| 503 | `state_unavailable` | durable state or the history journal is unreadable/unwritable |
 
 ## 7. Restart behaviour
 
@@ -136,3 +137,55 @@ $ curl -s localhost:8000/v1/stable | jq '.manifests[].digest'
 
 The last successful release is served from `/state/stable-index.json`; a failed
 release never overwrites it.
+
+## 8. Did an amd64/arm64 pair ever coexist on stable?
+
+Each successful release appends one bounded record to
+`/state/release-history.jsonl` (one digest per architecture, so the per-release
+write size is fixed). `POST /v1/stable/coexistence` scans that append-only
+journal and returns the maximal contiguous revision ranges where every
+submitted digest was active at the same time.
+
+```console
+$ curl -s -X POST localhost:8000/v1/stable/coexistence \
+    -H 'content-type: application/json' \
+    -d '{"platforms":[
+          {"platform":"linux/amd64","manifestDigest":"sha256:de954dbc…"},
+          {"platform":"linux/arm64","manifestDigest":"sha256:cb165f4b…"}]}' | jq .
+{
+  "ref": "registry.example.com/edge/stable:latest",
+  "requested": [ {"platform": "linux/amd64", "manifestDigest": "sha256:de954dbc…"},
+                 {"platform": "linux/arm64", "manifestDigest": "sha256:cb165f4b…"} ],
+  "coverage": {
+    "firstRevision": 0,
+    "lastRevision": 4,
+    "earlierRevisionsUnknown": false,
+    "historyEphemeral": false,
+    "firstRecordKind": "enablement"
+  },
+  "coexisting": true,
+  "intervals": [
+    {"startRevision": 2, "endRevision": 2, "revisions": 1,
+     "startRecordKind": "release", "endRecordKind": "release",
+     "touchesHistoryStart": false, "active": false},
+    {"startRevision": 4, "endRevision": 4, "revisions": 1,
+     "startRecordKind": "release", "endRecordKind": "release",
+     "touchesHistoryStart": false, "active": true}
+  ]
+}
+```
+
+The pair aligned at revision 2, split when amd64 moved away at revision 3, and
+reappeared at revision 4 — hence **two separate intervals**. The check reads no
+commit lock and is bounded by the last complete journal record, so releases can
+keep landing while it runs.
+
+A pair that was never simultaneously active returns `"coexisting": false` with
+an empty `intervals` list (an unknown digest is not an error by itself). On a
+volume created before this feature, history begins at the revision that was
+live when the journal was enabled; `coverage.earlierRevisionsUnknown` is then
+`true` and any interval touching that first revision carries
+`"touchesHistoryStart": true`.
+
+`examples/demo_coexistence.py` drives the whole split-and-restore scenario
+end to end.

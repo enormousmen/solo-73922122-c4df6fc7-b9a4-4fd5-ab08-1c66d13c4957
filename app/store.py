@@ -21,6 +21,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -31,6 +32,15 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .config import Settings
+from .history import (
+    RECORD_KIND_RELEASE,
+    HistoryError,
+    HistoryRecord,
+    HistoryView,
+    ReleaseHistory,
+    load_history_view,
+    reconcile_history,
+)
 from .oci import (
     INDEX_MEDIA_TYPES,
     OCI_INDEX_MEDIA_TYPE,
@@ -44,6 +54,8 @@ from .oci import (
 STATE_FILENAME = "stable-index.json"
 LOCK_FILENAME = "stable-index.lock"
 STATE_SCHEMA_VERSION = 1
+
+logger = logging.getLogger("release-api")
 
 
 class ConflictError(Exception):
@@ -102,6 +114,7 @@ class StableStore:
         self.layout = layout
         self.state_path = settings.state_dir / STATE_FILENAME
         self.lock_path = settings.state_dir / LOCK_FILENAME
+        self.history = ReleaseHistory(settings.state_dir)
         self._fallback: dict[str, Any] | None = None
         self._memory_lock = threading.Lock()
         try:
@@ -120,7 +133,55 @@ class StableStore:
             snapshot = self._seed_if_absent()
         with self._memory_lock:
             self._fallback = snapshot.index
+        if snapshot.persisted:
+            # Under the same cross-process lock used by commits: seed or
+            # catch up the append-only history journal. A read-only state
+            # directory skips writes and serves either an ephemeral view
+            # (no journal) or a read-only consistency check (journal present).
+            self._reconcile_history_at_startup(snapshot)
         return snapshot
+
+    def _reconcile_history_at_startup(self, snapshot: StoreSnapshot) -> None:
+        try:
+            with self._file_lock():
+                state = self._load_state_file()
+                reconcile_history(
+                    self.history,
+                    state_revision=state["revision"],
+                    state_digests=self._index_digests(state["index"]),
+                    state_updated_at=state.get("updatedAt"),
+                )
+            return
+        except (OSError, StoreError, HistoryError) as exc:
+            if not self.history.exists():
+                # Writable journal is impossible (read-only state dir): serve
+                # the preloaded/current index with an ephemeral history view.
+                logger.warning(
+                    "history journal unavailable, serving ephemeral view: %s", exc
+                )
+                return
+            # A journal already exists. If it is merely un-writable but fully
+            # consistent with the state file, read-only operation is safe;
+            # anything else (corruption, drift) must fail startup rather than
+            # fabricate ranges.
+            try:
+                records = self.history.read_records()
+            except HistoryError:
+                raise
+            if records[-1].revision != snapshot.revision:
+                raise
+            logger.warning(
+                "state directory not writable; serving read-only history view: %s",
+                exc,
+            )
+
+    @staticmethod
+    def _index_digests(index: dict[str, Any]) -> dict[str, str]:
+        return {
+            (desc.get("platform") or {}).get("architecture"): desc.get("digest")
+            for desc in index.get("manifests", [])
+            if isinstance(desc, dict)
+        }
 
     def _seed_if_absent(self) -> StoreSnapshot:
         """Seed revision 0 from the layout exactly once, even across workers.
@@ -489,7 +550,47 @@ class StableStore:
                 "index": new_index,
             }
             self._write_state(new_state)
+            # The state file is the source of truth and is already durable.
+            # Append the bounded journal record second; if this crashes the
+            # startup reconciliation closes the gap with one enablement
+            # record instead of silently dropping the revision span.
+            try:
+                self.history.append_record(
+                    HistoryRecord(
+                        revision=revision,
+                        kind=RECORD_KIND_RELEASE,
+                        digests=self._index_digests(new_index),
+                        updated_at=updated_at,
+                        released_architecture=verified.architecture,
+                    )
+                )
+            except HistoryError as exc:
+                # The release itself is already durable in the state file.
+                # Startup reconciliation repairs the journal; surface the
+                # degradation instead of losing the whole commit silently.
+                raise StoreError(f"release persisted but history journal failed: {exc}") from exc
             snapshot = self._snapshot_from_state(new_state)
             with self._memory_lock:
                 self._fallback = snapshot.index
             return snapshot, published[verified.architecture]
+
+    def history_view(self) -> HistoryView:
+        """Read-only point-in-time view of the revision journal.
+
+        Never takes the commit lock: the journal is append-only and each
+        line is self-contained, so concurrent releases keep flowing while a
+        coexistence check runs against the last complete record.
+        """
+        if self.state_path.exists():
+            state = self._load_state_file()
+            state_revision = state["revision"]
+            fallback_digests = self._index_digests(state["index"])
+        else:
+            fallback_snapshot = self._fallback_snapshot()
+            state_revision = fallback_snapshot.revision
+            fallback_digests = self._index_digests(fallback_snapshot.index)
+        return load_history_view(
+            self.history,
+            state_revision=state_revision,
+            fallback_digests=fallback_digests,
+        )

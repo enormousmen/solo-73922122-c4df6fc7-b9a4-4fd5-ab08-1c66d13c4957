@@ -7,6 +7,12 @@ amd64 fix never requires re-pushing arm64, and vice versa.
 Image content is verified from a **local, read-only OCI image layout** — no
 registry access, no network fetches.
 
+`POST /v1/stable/coexistence` answers the on-call question "were the amd64 and
+arm64 images ever live together in the same stable line?" by returning the
+maximal contiguous revision ranges where a submitted digest pair was active
+simultaneously. A pair that splits and later reappears is reported as two
+separate ranges.
+
 ## Architecture
 
 ```
@@ -15,14 +21,46 @@ registry access, no network fetches.
 │ layout-init  │──▶│ /oci-layout        │   │ /state               │
 │ (one-shot)   │   │  oci-layout        │   │  stable-index.json   │
 └──────────────┘   │  index.json        │   │  stable-index.lock   │
-                   │  blobs/sha256/…    │   └──────────┬───────────┘
-                   └────────┬───────────┘              │
-                            │ verify (chunked hashing) │ CAS commit
+                   │  blobs/sha256/…    │   │  release-history.jsonl│
+                   └────────┬───────────┘   └──────────┬───────────┘
+                            │ verify (chunked hashing) │ CAS commit + append
                    ┌────────▼───────────────────────────▼──────────┐
                    │ release-api (uvicorn, 2 workers)              │
                    │ GET  /v1/stable   POST /v1/releases           │
+                   │ POST /v1/stable/coexistence                   │
                    └───────────────────────────────────────────────┘
 ```
+
+### Coexistence history (`release-history.jsonl`)
+
+Every **successful** commit appends one fixed-shape JSON line describing the
+digest active on each architecture at that revision:
+
+```json
+{"digests":{"amd64":"sha256:…","arm64":"sha256:…"},"kind":"release",
+ "releasedArchitecture":"amd64","revision":3,"schemaVersion":1,
+ "updatedAt":"2026-11-25T00:13:51.282Z"}
+```
+
+* **Constant write per release.** One bounded line (two digests); the bytes
+  written do not grow as history accumulates. Appends use `O_APPEND` under the
+  same cross-process `flock` as the state-file commit, so two workers can
+  never interleave lines.
+* **Only successes count.** Verification failures (422), conflicts (409), and
+  in-flight scans never reach the journal.
+* **Point-in-time checks.** A coexistence check reads no lock and is bounded
+  by the last complete journal record, which is always ≤ the state revision.
+  Releases can keep committing while a check runs; a check never observes a
+  half-published revision.
+* **Old volumes and crash gaps.** On startup, under the commit lock, the
+  journal is reconciled with the state file: a missing journal (a volume
+  written before this feature) or a journal left behind by a crash gets one
+  `enablement` catch-up record at the current state revision. History starts
+  at that revision and every earlier revision is reported as unknown via
+  `coverage.earlierRevisionsUnknown`; a range touching the first known
+  revision carries `touchesHistoryStart`. A torn final journal line is
+  tolerated, but mid-file corruption fails startup rather than fabricating
+  ranges.
 
 ### Request flow for `POST /v1/releases`
 
@@ -41,7 +79,10 @@ registry access, no network fetches.
    the current digest, writing nothing. Otherwise replace only that platform's
    descriptor, keep the other exactly as it is, bump the revision, and persist.
 4. Persist atomically (temp file → `fsync` → `rename` → directory `fsync`), so a
-   reader or a crash only ever sees the whole old or whole new index.
+   reader or a crash only ever sees the whole old or whole new index. Then
+   append the bounded revision record to `release-history.jsonl` under the same
+   lock. If that append fails the release is still durable in the state file and
+   startup reconciliation repairs the journal.
 
 Consequences:
 
@@ -50,7 +91,7 @@ Consequences:
 * Failed verification (422) or a conflict (409) leaves the persisted index
   untouched; after a restart the last successful index is served.
 * Two uvicorn workers (or two containers) sharing `/state` serialise commits
-  through the file lock and each read the latest committed state.
+  through the file lock and each read the latest committed state and journal.
 
 ## Endpoints
 
@@ -60,8 +101,33 @@ Consequences:
 | `GET` | `/v1/stable/{arch}` | One platform descriptor (`amd64` or `arm64`). |
 | `POST` | `/v1/releases` | Release one architecture. |
 | `GET` | `/v1/releases` | Per-architecture last publication + currently active scans. |
-| `GET` | `/healthz` | Readiness, revision, persistence status, in-flight scans. |
+| `POST` | `/v1/stable/coexistence` | Revision ranges where submitted per-architecture digests were simultaneously stable. |
+| `GET` | `/healthz` | Readiness, revision, persistence and journal status, in-flight scans. |
 | `GET` | `/docs` | OpenAPI UI. |
+
+### `POST /v1/stable/coexistence`
+
+Submit one manifest digest per configured architecture:
+
+```json
+{
+  "platforms": [
+    {"platform": "linux/amd64", "manifestDigest": "sha256:51fdc…"},
+    {"platform": "linux/arm64", "manifestDigest": "sha256:a29c…"}
+  ]
+}
+```
+
+The response reports every maximal contiguous revision range where **all**
+submitted digests were active on their platforms at once. A split ends the
+current range; the same pair reappearing later opens a new one, so the two
+spans are listed separately. Each interval carries `startRevision` /
+`endRevision`, the record kinds at both ends, `touchesHistoryStart` (the range
+may begin before known history) and `active` (still live at the snapshot
+revision). The `coverage` object gives the check's first and last covered
+revisions, `earlierRevisionsUnknown`, and whether the view is ephemeral
+(read-only state directory). A digest that was never stable simply yields no
+interval rather than an error; malformed digests or platforms return 422.
 
 ## Run with Docker Compose
 
@@ -69,6 +135,7 @@ Consequences:
 docker compose up -d --build
 curl -s localhost:8000/v1/stable | jq .
 docker compose exec release-api python /srv/examples/demo_concurrent.py
+docker compose exec release-api python /srv/examples/demo_coexistence.py
 ```
 
 `docker-compose.yml`:
@@ -81,7 +148,10 @@ docker compose exec release-api python /srv/examples/demo_concurrent.py
   path. `LAYER_CHUNK_DELAY_MS=1` is a demo-only pause per 64 KiB chunk so the
   concurrency is visible on small demo layers; set it to `0` in production.
 
-Reset the demo (returns to the v1 baseline):
+The coexistence demo aligns both architectures on v2, splits amd64 to v3, then
+restores v2, and shows the two separate intervals the pair produced.
+
+Reset the demo (returns to the v1 baseline and a fresh journal):
 
 ```console
 docker compose down -v && docker compose up -d
@@ -102,9 +172,11 @@ OCI_LAYOUT_DIR=/tmp/oci-layout STATE_DIR=/tmp/state \
 
 # in another shell
 python examples/demo_concurrent.py --meta /tmp/oci-layout/demo-digests.json
+python examples/demo_coexistence.py --meta /tmp/oci-layout/demo-digests.json
 ```
 
-Tests (54 cases: validation, conflicts, durability, in-process and cross-process concurrency, endpoints):
+Tests (71 cases: validation, conflicts, durability, in-process and cross-process
+concurrency, coexistence intervals, journal reconciliation, endpoints):
 
 ```console
 python -m pytest -q
@@ -115,7 +187,7 @@ python -m pytest -q
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OCI_LAYOUT_DIR` | `/oci-layout` | OCI image layout root (read-only). |
-| `STATE_DIR` | `/state` | Writable directory for `stable-index.json`. |
+| `STATE_DIR` | `/state` | Writable directory for `stable-index.json` and `release-history.jsonl`. |
 | `OCI_INDEX_REF` | `registry.example.com/edge/stable:latest` | Reference recorded on the index. |
 | `OCI_ARCHITECTURES` | `amd64,arm64` | Platforms the index must contain. |
 | `LAYER_CHUNK_BYTES` | `65536` | Blob hashing chunk size (1 B – 16 MiB). |
@@ -138,7 +210,10 @@ the service cannot honour.
 
 ## What was exercised
 
-The test suite, a live two-worker uvicorn process, and the concurrent demo
-script were run against generated layouts in this environment. Docker itself is
-not installed here, so `docker compose up` was not executed; the Compose file is
-validated by YAML parsing only. See the delivery notes in the conversation.
+The 71-case test suite, a live two-worker uvicorn process, and both demo
+scripts were run against generated layouts in this environment. The coexistence
+demo was executed against the live two-worker server, including a full process
+restart that re-served the same intervals from the shared state directory.
+Docker itself is not installed here, so `docker compose up` was not executed;
+the Compose file is validated by YAML parsing only. See the delivery notes in
+the conversation.

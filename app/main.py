@@ -15,6 +15,10 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
+from .history import (
+    HistoryError,
+    find_coexistence_intervals,
+)
 from .oci import (
     OCI_INDEX_MEDIA_TYPE,
     OciLayout,
@@ -25,6 +29,43 @@ from .oci import (
 from .store import ConflictError, StableStore, StoreError
 
 logger = logging.getLogger("release-api")
+
+
+class CoexistencePlatform(BaseModel):
+    platform: str = Field(
+        ...,
+        description="Target platform, exactly 'linux/amd64' or 'linux/arm64'.",
+        examples=["linux/amd64"],
+    )
+    manifestDigest: str = Field(
+        ...,
+        description="Manifest digest that must be active for this platform.",
+        examples=["sha256:" + "0" * 64],
+    )
+
+
+class CoexistenceRequest(BaseModel):
+    platforms: list[CoexistencePlatform] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "One manifest digest per configured architecture. The pair matched "
+            "only when every listed digest is active on its platform together."
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "platforms": [
+                        {"platform": "linux/amd64", "manifestDigest": "sha256:" + "a" * 64},
+                        {"platform": "linux/arm64", "manifestDigest": "sha256:" + "b" * 64},
+                    ]
+                }
+            ]
+        }
+    }
 
 
 class ReleaseRequest(BaseModel):
@@ -171,12 +212,24 @@ def create_app(
                 status_code=503,
                 content={"status": "degraded", "reason": str(exc)},
             )
+        try:
+            view = store.history_view()
+            history_status = {
+                "available": True,
+                "ephemeral": view.ephemeral,
+                "firstRevision": view.first_known_revision,
+                "lastRevision": view.snapshot_revision,
+                "records": len(view.records),
+            }
+        except (HistoryError, StoreError) as exc:
+            history_status = {"available": False, "reason": str(exc)}
         return {
             "status": "ok",
             "ref": settings.index_ref,
             "revision": snapshot.revision,
             "persisted": snapshot.persisted,
             "architectures": list(settings.architectures),
+            "history": history_status,
             "activeReleases": service.active(),
         }
 
@@ -237,6 +290,86 @@ def create_app(
             "updatedAt": snapshot.updated_at,
             "published": published,
             "active": service.active(),
+        }
+
+    @app.post(
+        "/v1/stable/coexistence",
+        summary=(
+            "Revision ranges where the submitted manifest digests were active "
+            "on their platforms at the same time"
+        ),
+        status_code=200,
+    )
+    def check_coexistence(payload: CoexistenceRequest) -> Any:
+        # Validate shape first: known configured architectures, no duplicates,
+        # well-formed digests. Verification against the layout is intentionally
+        # not required: the pair is compared against what was actually stable.
+        wanted: dict[str, str] = {}
+        requested: list[dict[str, str]] = []
+        try:
+            for item in payload.platforms:
+                arch = _parse_platform(item.platform, settings)
+                digest = validate_digest(
+                    item.manifestDigest, what="manifestDigest"
+                )
+                if arch in wanted:
+                    raise ReleaseValidationError(
+                        f"duplicate entry for linux/{arch}", code="invalid_platform"
+                    )
+                wanted[arch] = digest
+                requested.append(
+                    {"platform": f"linux/{arch}", "manifestDigest": digest}
+                )
+            missing = [arch for arch in settings.architectures if arch not in wanted]
+            if missing:
+                raise ReleaseValidationError(
+                    "a digest is required for every configured architecture; missing "
+                    + ", ".join(f"linux/{arch}" for arch in missing),
+                    code="invalid_platform",
+                )
+        except ReleaseValidationError as exc:
+            return _error(422, exc.code, str(exc))
+
+        try:
+            # One read of the journal, bounded at its last complete record:
+            # releases committed while this check is in flight cannot enter
+            # the answer, and no commit lock is taken.
+            view = store.history_view()
+            intervals = find_coexistence_intervals(view, wanted)
+        except HistoryError as exc:
+            return _error(503, "state_unavailable", str(exc))
+        except StoreError as exc:
+            return _error(503, "state_unavailable", str(exc))
+
+        first_record = view.records[0]
+        ranges = [
+            {
+                "startRevision": interval.start_revision,
+                "endRevision": interval.end_revision,
+                "revisions": interval.end_revision - interval.start_revision + 1,
+                "startRecordKind": interval.start_kind,
+                "endRecordKind": interval.end_kind,
+                # A range touching the first known revision may have started
+                # before history began; its true start is not knowable.
+                "touchesHistoryStart": interval.history_start,
+                # Open-ended: the pair is still active at the snapshot revision.
+                "active": interval.end_revision == view.snapshot_revision,
+            }
+            for interval in intervals
+        ]
+        return {
+            "ref": settings.index_ref,
+            "requested": requested,
+            "coverage": {
+                # Revisions this check actually has complete records for.
+                "firstRevision": view.first_known_revision,
+                "lastRevision": view.snapshot_revision,
+                "earlierRevisionsUnknown": view.first_known_revision > 0,
+                "historyEphemeral": view.ephemeral,
+                "firstRecordKind": first_record.kind,
+            },
+            "coexisting": bool(ranges),
+            "intervals": ranges,
         }
 
     @app.post(
